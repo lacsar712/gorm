@@ -53,6 +53,7 @@ func SaveBeforeAssociations(create bool) func(db *gorm.DB) {
 					elems := reflect.MakeSlice(reflect.SliceOf(fieldType), 0, 10)
 					distinctElems := reflect.MakeSlice(reflect.SliceOf(fieldType), 0, 10)
 					identityMap := map[string]bool{}
+					cyclicElems := map[reflect.Value]int{}
 					for i := 0; i < rValLen; i++ {
 						obj := db.Statement.ReflectValue.Index(i)
 						if reflect.Indirect(obj).Kind() != reflect.Struct {
@@ -65,6 +66,18 @@ func SaveBeforeAssociations(create bool) func(db *gorm.DB) {
 							}
 							objs = append(objs, obj)
 							elems = reflect.Append(elems, rv)
+
+							if rel.Polymorphic == nil {
+								if key, ok := circularKey(rv); ok {
+									if state := circularBelongsToState(db, rel.FieldSchema, rv); state != circularStateNormal {
+										// circular reference: the related object is owned by a
+										// create callback still on the stack, it must not be
+										// saved again here
+										cyclicElems[key] = state
+										continue
+									}
+								}
+							}
 
 							relPrimaryValues := make([]interface{}, 0, len(rel.FieldSchema.PrimaryFields))
 							for _, pf := range rel.FieldSchema.PrimaryFields {
@@ -84,9 +97,27 @@ func SaveBeforeAssociations(create bool) func(db *gorm.DB) {
 					}
 
 					if elems.Len() > 0 {
-						if saveAssociations(db, rel, distinctElems, selectColumns, restricted, nil) == nil {
+						var saveErr error
+						if distinctElems.Len() > 0 {
+							saveErr = saveAssociations(db, rel, distinctElems, selectColumns, restricted, nil)
+						}
+						if saveErr == nil {
 							for i := 0; i < elems.Len(); i++ {
-								setupReferences(objs[i], elems.Index(i))
+								elem := elems.Index(i)
+								if rel.Polymorphic == nil {
+									if key, ok := circularKey(elem); ok {
+										switch cyclicElems[key] {
+										case circularStateDefer:
+											circularDeferReference(db, db.Statement.Schema, rel.FieldSchema, objs[i], elem,
+												circularReferencePairs(rel, false))
+											continue
+										case circularStateUseExisting:
+											setupReferences(objs[i], elem)
+											continue
+										}
+									}
+								}
+								setupReferences(objs[i], elem)
 							}
 						}
 					}
@@ -97,8 +128,21 @@ func SaveBeforeAssociations(create bool) func(db *gorm.DB) {
 							rv = rv.Addr()
 						}
 
-						if saveAssociations(db, rel, rv, selectColumns, restricted, nil) == nil {
+						state := circularStateNormal
+						if rel.Polymorphic == nil {
+							state = circularBelongsToState(db, rel.FieldSchema, rv)
+						}
+
+						switch state {
+						case circularStateDefer:
+							circularDeferReference(db, db.Statement.Schema, rel.FieldSchema, db.Statement.ReflectValue, rv,
+								circularReferencePairs(rel, false))
+						case circularStateUseExisting:
 							setupReferences(db.Statement.ReflectValue, rv)
+						default:
+							if saveAssociations(db, rel, rv, selectColumns, restricted, nil) == nil {
+								setupReferences(db.Statement.ReflectValue, rv)
+							}
 						}
 					}
 				}
@@ -141,6 +185,14 @@ func SaveAfterAssociations(create bool) func(db *gorm.DB) {
 									rv = rv.Addr()
 								}
 
+								if rel.Polymorphic == nil && circularHasChildState(db, rel.FieldSchema, rv) == circularStateDefer {
+									// circular reference: the related row is inserted later,
+									// its foreign key is backfilled in the same transaction
+									circularDeferReference(db, rel.FieldSchema, db.Statement.Schema, rv, obj,
+										circularReferencePairs(rel, true))
+									continue
+								}
+
 								for _, ref := range rel.References {
 									if ref.OwnPrimaryKey {
 										fv, _ := ref.PrimaryKey.ValueOf(db.Statement.Context, obj)
@@ -170,18 +222,25 @@ func SaveAfterAssociations(create bool) func(db *gorm.DB) {
 							f = f.Addr()
 						}
 
-						assignmentColumns := make([]string, 0, len(rel.References))
-						for _, ref := range rel.References {
-							if ref.OwnPrimaryKey {
-								fv, _ := ref.PrimaryKey.ValueOf(db.Statement.Context, db.Statement.ReflectValue)
-								db.AddError(ref.ForeignKey.Set(db.Statement.Context, f, fv))
-							} else if ref.PrimaryValue != "" {
-								db.AddError(ref.ForeignKey.Set(db.Statement.Context, f, ref.PrimaryValue))
+						if rel.Polymorphic == nil && circularHasChildState(db, rel.FieldSchema, f) == circularStateDefer {
+							// circular reference: the related row is inserted later,
+							// its foreign key is backfilled in the same transaction
+							circularDeferReference(db, rel.FieldSchema, db.Statement.Schema, f, db.Statement.ReflectValue,
+								circularReferencePairs(rel, true))
+						} else {
+							assignmentColumns := make([]string, 0, len(rel.References))
+							for _, ref := range rel.References {
+								if ref.OwnPrimaryKey {
+									fv, _ := ref.PrimaryKey.ValueOf(db.Statement.Context, db.Statement.ReflectValue)
+									db.AddError(ref.ForeignKey.Set(db.Statement.Context, f, fv))
+								} else if ref.PrimaryValue != "" {
+									db.AddError(ref.ForeignKey.Set(db.Statement.Context, f, ref.PrimaryValue))
+								}
+								assignmentColumns = append(assignmentColumns, ref.ForeignKey.DBName)
 							}
-							assignmentColumns = append(assignmentColumns, ref.ForeignKey.DBName)
-						}
 
-						saveAssociations(db, rel, f, selectColumns, restricted, assignmentColumns)
+							saveAssociations(db, rel, f, selectColumns, restricted, assignmentColumns)
+						}
 					}
 				}
 			}
@@ -205,6 +264,15 @@ func SaveAfterAssociations(create bool) func(db *gorm.DB) {
 
 						for i := 0; i < f.Len(); i++ {
 							elem := f.Index(i)
+
+							if rel.Polymorphic == nil && circularHasChildState(db, rel.FieldSchema, elem) == circularStateDefer {
+								// circular reference: the child row is inserted later,
+								// its foreign key is backfilled in the same transaction
+								circularDeferReference(db, rel.FieldSchema, db.Statement.Schema, elem, v,
+									circularReferencePairs(rel, true))
+								continue
+							}
+
 							for _, ref := range rel.References {
 								if ref.OwnPrimaryKey {
 									pv, _ := ref.PrimaryKey.ValueOf(db.Statement.Context, v)
@@ -413,6 +481,10 @@ func saveAssociations(db *gorm.DB, rel *schema.Relationship, rValues reflect.Val
 		tx.Statement.Settings.Store(k, v)
 		return true
 	})
+
+	// internal association saves carry ON CONFLICT but still take part in
+	// circular reference handling, unlike caller provided upserts
+	tx = tx.Set(associationSaveStoreKey, true)
 
 	if tx.Statement.FullSaveAssociations {
 		tx = tx.Set("gorm:update_track_time", true)

@@ -40,11 +40,15 @@ func RegisterDefaultCallbacks(db *gorm.DB, config *Config) {
 
 	createCallback := db.Callback().Create()
 	createCallback.Match(enableTransaction).Register("gorm:begin_transaction", BeginTransaction)
+	createCallback.Register("gorm:circular_reference_begin", CircularReferenceBegin)
 	createCallback.Register("gorm:before_create", BeforeCreate)
 	createCallback.Register("gorm:save_before_associations", SaveBeforeAssociations(true))
 	createCallback.Register("gorm:create", Create(config))
+	createCallback.Register("gorm:circular_reference_after_insert", CircularReferenceAfterInsert)
 	createCallback.Register("gorm:save_after_associations", SaveAfterAssociations(true))
+	createCallback.Register("gorm:circular_reference_resolve", CircularReferenceResolve)
 	createCallback.Register("gorm:after_create", AfterCreate)
+	createCallback.Register("gorm:circular_reference_end", CircularReferenceEnd)
 	createCallback.Match(enableTransaction).Register("gorm:commit_or_rollback_transaction", CommitOrRollbackTransaction)
 	createCallback.Clauses = config.CreateClauses
 

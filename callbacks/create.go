@@ -295,6 +295,12 @@ func ConvertToCreateValues(stmt *gorm.Statement) (values clause.Values) {
 				values.Values[i] = make([]interface{}, len(values.Columns))
 				for idx, column := range values.Columns {
 					field := stmt.Schema.FieldsByDBName[column.Name]
+					if circularNilForeignKey(stmt, stmt.ReflectValue.Index(i), column.Name) {
+						// circular foreign key: insert NULL and backfill the real
+						// primary key once the referenced row exists
+						values.Values[i][idx] = nil
+						continue
+					}
 					if values.Values[i][idx], isZero = field.ValueOf(stmt.Context, rv); isZero {
 						if field.DefaultValueInterface != nil {
 							values.Values[i][idx] = field.DefaultValueInterface
@@ -337,6 +343,12 @@ func ConvertToCreateValues(stmt *gorm.Statement) (values clause.Values) {
 			values.Values = [][]interface{}{make([]interface{}, len(values.Columns))}
 			for idx, column := range values.Columns {
 				field := stmt.Schema.FieldsByDBName[column.Name]
+				if circularNilForeignKey(stmt, stmt.ReflectValue, column.Name) {
+					// circular foreign key: insert NULL and backfill the real
+					// primary key once the referenced row exists
+					values.Values[0][idx] = nil
+					continue
+				}
 				if values.Values[0][idx], isZero = field.ValueOf(stmt.Context, stmt.ReflectValue); isZero {
 					if field.DefaultValueInterface != nil {
 						values.Values[0][idx] = field.DefaultValueInterface
